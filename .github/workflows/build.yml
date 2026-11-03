@@ -6,12 +6,14 @@ name: Z-Store builder
 on:
   workflow_call:
     secrets:
-      ZSTORE_KEYSTORE_BASE64: { required: true }
-      ZSTORE_KEYSTORE_PASSWORD: { required: true }
-      ZSTORE_KEY_ALIAS: { required: true }
-      ZSTORE_KEY_PASSWORD: { required: true }
-      ZSTORE_API_URL: { required: true }
-      ZSTORE_CI_TOKEN: { required: true }
+      # Tous optionnels : sans clé, l'APK est signé avec une clé de TEST jetable ;
+      # sans URL Z-Store, l'APK reste seulement disponible comme artefact GitHub.
+      ZSTORE_KEYSTORE_BASE64: { required: false }
+      ZSTORE_KEYSTORE_PASSWORD: { required: false }
+      ZSTORE_KEY_ALIAS: { required: false }
+      ZSTORE_KEY_PASSWORD: { required: false }
+      ZSTORE_API_URL: { required: false }
+      ZSTORE_CI_TOKEN: { required: false }
 
 jobs:
   build:
@@ -38,7 +40,7 @@ jobs:
           echo "BUILD_ID=$BUILD_ID" >> "$GITHUB_ENV"
 
       - name: Signaler « en cours » à Z-Store
-        if: steps.meta.outputs.build_id != ''
+        if: steps.meta.outputs.build_id != '' && env.ZSTORE_API_URL != ''
         continue-on-error: true
         run: |
           curl -sS --max-time 30 -X POST "$ZSTORE_API_URL/ci/report" \
@@ -104,11 +106,20 @@ jobs:
           echo "APK trouvé : $APK"
           BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)"
           echo "$BT" >> "$GITHUB_PATH"
-          echo "${{ secrets.ZSTORE_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/zstore.jks"
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/zstore.jks"
+            ALIAS="$KS_ALIAS"
+          else
+            echo "::warning::Aucune clé de signature configurée : APK signé avec une clé de TEST jetable (à ne pas publier)."
+            export KS_PASS=zstore-test KEY_PASS=zstore-test
+            ALIAS=test
+            keytool -genkeypair -noprompt -keystore "$RUNNER_TEMP/zstore.jks" -alias test -keyalg RSA -keysize 2048 \
+              -validity 3650 -storepass "$KS_PASS" -keypass "$KEY_PASS" -dname "CN=Z-Store Test"
+          fi
           "$BT/zipalign" -p -f 4 "$APK" "$RUNNER_TEMP/aligned.apk"
           "$BT/apksigner" sign \
             --ks "$RUNNER_TEMP/zstore.jks" \
-            --ks-key-alias "${{ secrets.ZSTORE_KEY_ALIAS }}" \
+            --ks-key-alias "$ALIAS" \
             --ks-pass env:KS_PASS --key-pass env:KEY_PASS \
             --out "$RUNNER_TEMP/app-signed.apk" "$RUNNER_TEMP/aligned.apk"
           "$BT/apksigner" verify "$RUNNER_TEMP/app-signed.apk"
@@ -132,6 +143,8 @@ jobs:
             unzip -p "$RUNNER_TEMP/app-signed.apk" "$ICON_PATH" > "$RUNNER_TEMP/icon.img" || true
           fi
         env:
+          KS_B64: ${{ secrets.ZSTORE_KEYSTORE_BASE64 }}
+          KS_ALIAS: ${{ secrets.ZSTORE_KEY_ALIAS }}
           KS_PASS: ${{ secrets.ZSTORE_KEYSTORE_PASSWORD }}
           KEY_PASS: ${{ secrets.ZSTORE_KEY_PASSWORD }}
 
@@ -144,7 +157,7 @@ jobs:
 
       - name: Publier dans Z-Store
         id: publish
-        if: steps.meta.outputs.build_id != ''
+        if: steps.meta.outputs.build_id != '' && env.ZSTORE_API_URL != ''
         run: |
           ICON_ARG=()
           if [ -s "$RUNNER_TEMP/icon.img" ]; then ICON_ARG=(-F "icon=@$RUNNER_TEMP/icon.img"); fi
@@ -166,7 +179,7 @@ jobs:
 
       - name: Envoyer les erreurs à Z-Store
         # Si c'est l'envoi à Z-Store qui a échoué, le serveur a déjà enregistré la raison
-        if: failure() && steps.meta.outputs.build_id != '' && steps.publish.outcome != 'failure'
+        if: failure() && steps.meta.outputs.build_id != '' && env.ZSTORE_API_URL != '' && steps.publish.outcome != 'failure'
         run: |
           touch build.log
           {
