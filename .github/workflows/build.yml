@@ -1,0 +1,185 @@
+# Z-Store — workflow de compilation réutilisable.
+# Appelé par .github/workflows/zstore.yml dans chaque repo d'app (généré par le serveur Z-Store).
+# Supporte : projets Android Gradle (Kotlin/Java) et projets Capacitor (package.json + android/).
+name: Z-Store builder
+
+on:
+  workflow_call:
+    secrets:
+      ZSTORE_KEYSTORE_BASE64: { required: true }
+      ZSTORE_KEYSTORE_PASSWORD: { required: true }
+      ZSTORE_KEY_ALIAS: { required: true }
+      ZSTORE_KEY_PASSWORD: { required: true }
+      ZSTORE_API_URL: { required: true }
+      ZSTORE_CI_TOKEN: { required: true }
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ZSTORE_API_URL: ${{ secrets.ZSTORE_API_URL }}
+      ZSTORE_CI_TOKEN: ${{ secrets.ZSTORE_CI_TOKEN }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Lire .zstore/build.json
+        id: meta
+        run: |
+          BUILD_ID=""; JAVA=17
+          if [ -f .zstore/build.json ]; then
+            BUILD_ID=$(jq -r '.build_id // empty' .zstore/build.json)
+            JAVA=$(jq -r '.java // "17"' .zstore/build.json)
+          fi
+          echo "build_id=$BUILD_ID" >> "$GITHUB_OUTPUT"
+          echo "java=$JAVA" >> "$GITHUB_OUTPUT"
+          echo "BUILD_ID=$BUILD_ID" >> "$GITHUB_ENV"
+
+      - name: Signaler « en cours » à Z-Store
+        if: steps.meta.outputs.build_id != ''
+        continue-on-error: true
+        run: |
+          curl -sS --max-time 30 -X POST "$ZSTORE_API_URL/ci/report" \
+            -H "X-ZStore-CI: $ZSTORE_CI_TOKEN" \
+            --form-string build_id="$BUILD_ID" --form-string status=running --form-string run_url="$RUN_URL"
+
+      - name: Installer Java ${{ steps.meta.outputs.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.meta.outputs.java }}
+
+      - name: Installer Node (projets Capacitor)
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Installer Gradle (si pas de gradlew)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+
+      - name: Compiler
+        id: compile
+        run: |
+          set -o pipefail
+          : > build.log
+          {
+            if [ -f package.json ]; then
+              echo "▶ Projet web/Capacitor détecté"
+              if [ -f package-lock.json ]; then npm ci; else npm install; fi
+              npm run build --if-present
+              if [ ! -d android ]; then npx cap add android; fi
+              npx cap sync android
+            fi
+            if [ -f android/settings.gradle ] || [ -f android/settings.gradle.kts ]; then
+              cd android
+            elif [ ! -f settings.gradle ] && [ ! -f settings.gradle.kts ]; then
+              echo "error: Aucun projet Android trouvé (settings.gradle introuvable à la racine ni dans android/)"
+              exit 1
+            fi
+            echo "PROJECT_DIR=$(pwd)" >> "$GITHUB_ENV"
+            if [ -f gradlew ]; then
+              chmod +x gradlew
+              ./gradlew assembleRelease --stacktrace --no-daemon
+            else
+              echo "▶ Pas de gradlew : utilisation de Gradle 8.11.1"
+              gradle assembleRelease --stacktrace --no-daemon
+            fi
+          } 2>&1 | tee -a build.log
+
+      - name: Signer l'APK
+        id: sign
+        run: |
+          set -e
+          exec > >(tee -a build.log) 2>&1
+          APK=$(find "$PROJECT_DIR" -path '*/build/outputs/apk/*' -name '*release*.apk' | grep -v androidTest | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "error: Aucun APK release produit (build/outputs/apk/release introuvable)"
+            exit 1
+          fi
+          echo "APK trouvé : $APK"
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)"
+          echo "$BT" >> "$GITHUB_PATH"
+          echo "${{ secrets.ZSTORE_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/zstore.jks"
+          "$BT/zipalign" -p -f 4 "$APK" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign \
+            --ks "$RUNNER_TEMP/zstore.jks" \
+            --ks-key-alias "${{ secrets.ZSTORE_KEY_ALIAS }}" \
+            --ks-pass env:KS_PASS --key-pass env:KEY_PASS \
+            --out "$RUNNER_TEMP/app-signed.apk" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify "$RUNNER_TEMP/app-signed.apk"
+          rm -f "$RUNNER_TEMP/zstore.jks"
+
+          BADGING=$("$BT/aapt2" dump badging "$RUNNER_TEMP/app-signed.apk")
+          PKG=$(echo "$BADGING" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")
+          VC=$(echo "$BADGING" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" | head -n 1)
+          VN=$(echo "$BADGING" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -n 1)
+          LABEL=$(echo "$BADGING" | sed -n "s/^application-label:'\(.*\)'$/\1/p" | head -n 1)
+          MINSDK=$(echo "$BADGING" | sed -n "s/^sdkVersion:'\([0-9]*\)'.*/\1/p" | head -n 1)
+          echo "Package=$PKG versionCode=$VC versionName=$VN label=$LABEL minSdk=$MINSDK"
+          {
+            echo "pkg=$PKG"; echo "vc=$VC"; echo "vn=$VN"; echo "label=$LABEL"; echo "minsdk=$MINSDK"
+          } >> "$GITHUB_OUTPUT"
+
+          # Icône : la plus grande PNG du launcher dans l'APK (les icônes adaptatives XML sont ignorées)
+          ICON_PATH=$(unzip -Z1 "$RUNNER_TEMP/app-signed.apk" | grep -E '^res/(mipmap|drawable)[^/]*/(ic_launcher|icon)[^/]*\.(png|webp)$' | grep -v foreground | grep -v background \
+            | awk '{ s=0; if ($0 ~ /xxxhdpi/) s=5; else if ($0 ~ /xxhdpi/) s=4; else if ($0 ~ /xhdpi/) s=3; else if ($0 ~ /hdpi/) s=2; print s" "$0 }' | sort -rn | head -n 1 | cut -d' ' -f2)
+          if [ -n "$ICON_PATH" ]; then
+            unzip -p "$RUNNER_TEMP/app-signed.apk" "$ICON_PATH" > "$RUNNER_TEMP/icon.img" || true
+          fi
+        env:
+          KS_PASS: ${{ secrets.ZSTORE_KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.ZSTORE_KEY_PASSWORD }}
+
+      - name: Garder l'APK comme artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ steps.sign.outputs.pkg }}-${{ steps.sign.outputs.vc }}
+          path: ${{ runner.temp }}/app-signed.apk
+          retention-days: 14
+
+      - name: Publier dans Z-Store
+        id: publish
+        if: steps.meta.outputs.build_id != ''
+        run: |
+          ICON_ARG=()
+          if [ -s "$RUNNER_TEMP/icon.img" ]; then ICON_ARG=(-F "icon=@$RUNNER_TEMP/icon.img"); fi
+          HTTP=$(curl -sS --max-time 600 -o resp.json -w '%{http_code}' -X POST "$ZSTORE_API_URL/ci/report" \
+            -H "X-ZStore-CI: $ZSTORE_CI_TOKEN" \
+            --form-string build_id="$BUILD_ID" --form-string status=success --form-string run_url="$RUN_URL" \
+            --form-string package_name="${{ steps.sign.outputs.pkg }}" \
+            --form-string version_code="${{ steps.sign.outputs.vc }}" \
+            --form-string version_name="${{ steps.sign.outputs.vn }}" \
+            --form-string app_label="${{ steps.sign.outputs.label }}" \
+            --form-string min_sdk="${{ steps.sign.outputs.minsdk }}" \
+            -F "apk=@$RUNNER_TEMP/app-signed.apk;type=application/vnd.android.package-archive" \
+            "${ICON_ARG[@]}")
+          cat resp.json; echo
+          if [ "$HTTP" -ge 300 ]; then
+            echo "::error::Z-Store a refusé l'APK (HTTP $HTTP)"
+            exit 1
+          fi
+
+      - name: Envoyer les erreurs à Z-Store
+        # Si c'est l'envoi à Z-Store qui a échoué, le serveur a déjà enregistré la raison
+        if: failure() && steps.meta.outputs.build_id != '' && steps.publish.outcome != 'failure'
+        run: |
+          touch build.log
+          {
+            echo "=== Erreurs détectées ==="
+            grep -nE "^e: |error:|ERROR|FAILURE:|What went wrong|Could not|Execution failed|Unresolved reference|Exception:|npm ERR!|\[ERROR\]" build.log | grep -v "^.*warning:" | head -n 120
+            echo
+            echo "=== Fin du log ==="
+            tail -n 60 build.log
+          } > errors.txt
+          if [ ! -s build.log ]; then
+            echo "L'échec est survenu avant la compilation (installation, signature ou envoi). Voir les logs complets sur GitHub." > errors.txt
+          fi
+          curl -sS --max-time 60 -X POST "$ZSTORE_API_URL/ci/report" \
+            -H "X-ZStore-CI: $ZSTORE_CI_TOKEN" \
+            --form-string build_id="$BUILD_ID" --form-string status=failure --form-string run_url="$RUN_URL" \
+            -F "error_log=<errors.txt"
